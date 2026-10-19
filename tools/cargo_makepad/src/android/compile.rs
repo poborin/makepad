@@ -275,8 +275,28 @@ struct BuildPaths {
     manifest_file: PathBuf,
     java_file: PathBuf,
     xr_file: PathBuf,
+    /// `<crate>/resources/android/java/**/*.java`, compiled beside Makepad's.
+    app_java_sources: Vec<PathBuf>,
+    /// `<crate>/resources/android/libs/*.jar`: on javac's classpath, and dexed.
+    app_jars: Vec<PathBuf>,
     dst_unaligned_apk: PathBuf,
     dst_apk: PathBuf,
+}
+
+/// The files under `dir` (recursively) whose extension is `ext`, sorted. An app
+/// ships Java this way when the system class loader must find it, as for a
+/// `Service` or `BroadcastReceiver` its manifest declares (a push receiver).
+fn app_android_files(dir: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = ls(dir)?
+        .into_iter()
+        .filter(|rel| rel.extension().and_then(|e| e.to_str()) == Some(ext))
+        .map(|rel| dir.join(rel))
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 pub struct BuildResult {
@@ -1121,6 +1141,10 @@ fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
     let xr_file = tmp_dir.join(&java_path).join("MakepadAppXr.java");
     write_text(&xr_file, &xr_java)?;
 
+    let app_android = build_crate_dir.join("resources/android");
+    let app_java_sources = app_android_files(&app_android.join("java"), "java")?;
+    let app_jars = app_android_files(&app_android.join("libs"), "jar")?;
+
     let apk_filename = to_snakecase(opts.app_label);
     let dst_unaligned_apk = out_dir.join(format!("{apk_filename}.unaligned.apk"));
     let dst_apk = out_dir.join(format!("{apk_filename}.apk"));
@@ -1136,6 +1160,8 @@ fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
         manifest_file,
         java_file,
         xr_file,
+        app_java_sources,
+        app_jars,
         dst_unaligned_apk,
         dst_apk,
     })
@@ -1192,7 +1218,7 @@ fn compile_java(
     let makepad_java_classes_dir = &cargo_manifest_dir
         .join("src/android/java/")
         .join(makepad_package_path);
-    let java_sources = vec![
+    let mut java_sources = vec![
         r_class_path.clone(),
         makepad_java_classes_dir.join("MakepadNative.java"),
         makepad_java_classes_dir.join("MakepadActivity.java"),
@@ -1210,9 +1236,10 @@ fn compile_java(
         build_paths.java_file.clone(),
         build_paths.xr_file.clone(),
     ];
+    java_sources.extend(build_paths.app_java_sources.iter().cloned());
 
     let mut hasher = DefaultHasher::new();
-    for source in &java_sources {
+    for source in java_sources.iter().chain(&build_paths.app_jars) {
         source.to_string_lossy().hash(&mut hasher);
         fs::read(source)
             .map_err(|e| format!("failed to read Java source {:?}: {e}", source))?
@@ -1254,6 +1281,10 @@ fn compile_java(
     }
 
     let android_jar = android_jar_path(sdk_dir, urls);
+    let classpath = std::env::join_paths(
+        std::iter::once(&android_jar).chain(&build_paths.app_jars),
+    )
+    .map_err(|e| format!("can't join the javac classpath: {e}"))?;
     let _ = rmdir(&build_paths.java_out_dir);
     mkdir(&build_paths.java_out_dir)?;
     // Force UTF-8: Chinese Windows defaults javac to GBK, and UTF-8 comments
@@ -1267,7 +1298,7 @@ fn compile_java(
         "1.8",
         "-Xlint:-options",
         "-classpath",
-        android_jar.to_str().unwrap(),
+        classpath.to_str().unwrap(),
         "-Xlint:deprecation",
         "-d",
         build_paths.java_out_dir.to_str().unwrap(),
@@ -1315,11 +1346,14 @@ fn build_dex(
 
     let d8_jar = d8_jar_path(sdk_dir, urls);
     let android_jar = android_jar_path(sdk_dir, urls);
+    let min_api = urls.sdk_version.to_string();
 
     let mut args: Vec<&str> = vec![
         "-cp",
         d8_jar.to_str().unwrap(),
         "com.android.tools.r8.D8",
+        "--min-api",
+        &min_api,
         "--classpath",
         android_jar.to_str().unwrap(),
         "--output",
@@ -1328,6 +1362,9 @@ fn build_dex(
 
     for class_file in &class_files {
         args.push(class_file.to_str().unwrap());
+    }
+    for jar in &build_paths.app_jars {
+        args.push(jar.to_str().unwrap());
     }
 
     shell_env_cap(
@@ -1881,7 +1918,10 @@ fn cp_android_runtime_assets(
             &dst_dir.join("android"),
             &format!("{logical_prefix}/android"),
             |relative| {
-                relative.starts_with("AndroidManifest.xml.template") || relative.starts_with("res")
+                relative.starts_with("AndroidManifest.xml.template")
+                    || relative.starts_with("res")
+                    || relative.starts_with("java")
+                    || relative.starts_with("libs")
             },
             |_| Ok(()),
         )?;
@@ -2446,8 +2486,15 @@ fn assemble_aab_base_module(
             .map_err(|e| format!("Cant write to {:?}: {e}", dst_path))?;
     }
 
-    // dex/classes.dex
-    cp(classes_dex, &base_dir.join("dex/classes.dex"), false)?;
+    // dex/classes.dex, and classes2.dex… when d8 split past 64K methods.
+    let dex_dir = classes_dex.parent().unwrap();
+    for dex in fs::read_dir(dex_dir).map_err(|e| format!("Cant read {:?}: {e}", dex_dir))? {
+        let dex = dex.map_err(|e| format!("Cant read {:?}: {e}", dex_dir))?.path();
+        let name = dex.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("classes") && name.ends_with(".dex") {
+            cp(&dex, &base_dir.join("dex").join(name), false)?;
+        }
+    }
 
     // lib/<abi>/*.so (only if the staged libs dir actually has anything).
     if libs_root.is_dir() && ls(libs_root).map(|v| !v.is_empty()).unwrap_or(false) {
@@ -3189,8 +3236,8 @@ pub fn adb_tcp(
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_android_rustflags, parse_adb_devices, parse_ip_addr_show, parse_ip_route,
-        stage_makepad_assets_subdir,
+        app_android_files, compose_android_rustflags, parse_adb_devices, parse_ip_addr_show,
+        parse_ip_route, stage_makepad_assets_subdir,
     };
     use crate::font_assets::{FontAssetManifest, FontPackage};
     use std::{fs, sync::atomic::{AtomicU64, Ordering}};
@@ -3238,6 +3285,59 @@ mod tests {
         assert!(!packaged.join("international.ttf").exists());
         assert!(packaged.join("theme.ron").is_file());
         assert_eq!(inventory.fonts["demo_app/resources/latin.ttf"], 11);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_android_files_finds_nested_sources_sorted() {
+        let root = temp_dir("app-java");
+        let java = root.join("java");
+        fs::create_dir_all(java.join("com/example/push")).unwrap();
+        fs::create_dir_all(java.join("com/example/a")).unwrap();
+        fs::write(java.join("com/example/push/Receiver.java"), b"class Receiver {}").unwrap();
+        fs::write(java.join("com/example/a/First.java"), b"class First {}").unwrap();
+        fs::write(java.join("com/example/push/notes.txt"), b"not java").unwrap();
+
+        let found = app_android_files(&java, "java").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                java.join("com/example/a/First.java"),
+                java.join("com/example/push/Receiver.java"),
+            ]
+        );
+        assert!(app_android_files(&root.join("libs"), "jar").unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mobile_asset_staging_leaves_out_android_build_inputs() {
+        let manifest = FontAssetManifest::parse(
+            b"format=makepad.font-assets.v1\nset=Latin\nasset=demo_app/resources/latin.ttf\n",
+        )
+        .unwrap();
+        let root = temp_dir("build-inputs");
+        let source = root.join("source");
+        let assets = root.join("assets");
+        let android = source.join("android");
+        for dir in ["java/com/example", "libs", "res/values"] {
+            fs::create_dir_all(android.join(dir)).unwrap();
+        }
+        fs::write(android.join("java/com/example/Receiver.java"), b"class Receiver {}").unwrap();
+        fs::write(android.join("libs/vendor.jar"), b"jar").unwrap();
+        fs::write(android.join("res/values/strings.xml"), b"<resources/>").unwrap();
+        fs::write(android.join("AndroidManifest.xml.template"), b"<manifest/>").unwrap();
+        fs::write(android.join("runtime.json"), b"{}").unwrap();
+
+        let mut package = FontPackage::new(&manifest);
+        stage_makepad_assets_subdir(&assets, "demo-app", &source, "resources", &mut package)
+            .unwrap();
+
+        let packaged = assets.join("makepad/demo_app/resources/android");
+        assert!(packaged.join("runtime.json").is_file());
+        for input in ["java", "libs", "res", "AndroidManifest.xml.template"] {
+            assert!(!packaged.join(input).exists(), "{input} was packaged");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
